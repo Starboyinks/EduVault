@@ -1,5 +1,5 @@
-;; EduVault - Decentralized Scholarship Fund with DAO Governance
-;; A smart contract for managing and distributing educational scholarships
+;; EduVault - Decentralized Scholarship Fund with DAO Governance and Staking
+;; A smart contract for managing and distributing educational scholarships with yield generation
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -12,6 +12,8 @@
 (define-constant err-already-voted (err u106))
 (define-constant err-proposal-ended (err u107))
 (define-constant err-threshold-not-met (err u108))
+(define-constant err-insufficient-stake (err u109))
+(define-constant err-lock-period-active (err u110))
 
 ;; Data variables
 (define-data-var minimum-donation uint u1000000) ;; In microSTX
@@ -22,6 +24,9 @@
 (define-data-var total-stakeholders uint u0)
 (define-data-var next-proposal-id uint u0)
 (define-data-var total-voting-power uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var yield-rate uint u5) ;; 5% annual yield rate (can be adjusted via governance)
+(define-data-var minimum-lock-period uint u52560) ;; Minimum staking period in blocks (~1 year)
 
 ;; Principal Maps
 (define-map stakeholders
@@ -30,7 +35,10 @@
         role: (string-ascii 20), ;; donor, educator, or alumni
         voting-power: uint,
         last-active: uint,
-        total-donated: uint
+        total-donated: uint,
+        staked-amount: uint,
+        stake-start-block: uint,
+        rewards-claimed: uint
     }
 )
 
@@ -84,6 +92,78 @@
     {vote: bool, weight: uint}
 )
 
+;; Staking Functions
+
+(define-read-only (calculate-rewards (staked-amount uint) (blocks-staked uint))
+    (let
+        (
+            (annual-blocks u52560) ;; Approximately number of blocks in a year
+            (reward-rate (var-get yield-rate))
+            (reward-multiplier (/ (* blocks-staked reward-rate) (* annual-blocks u100)))
+        )
+        (* staked-amount reward-multiplier)
+    )
+)
+
+(define-public (stake-tokens (amount uint))
+    (let
+        (
+            (current-stakeholder (unwrap! (map-get? stakeholders tx-sender) err-not-stakeholder))
+            (current-stake (get staked-amount current-stakeholder))
+        )
+        (asserts! (>= amount (var-get minimum-donation)) err-invalid-amount)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set stakeholders tx-sender
+            (merge current-stakeholder
+                {
+                    staked-amount: (+ current-stake amount),
+                    stake-start-block: block-height,
+                    voting-power: (+ (get voting-power current-stakeholder) amount)
+                }
+            )
+        )
+        (var-set total-staked (+ (var-get total-staked) amount))
+        (var-set total-voting-power (+ (var-get total-voting-power) amount))
+        (ok true)
+    )
+)
+
+(define-public (unstake-tokens (amount uint))
+    (let
+        (
+            (current-stakeholder (unwrap! (map-get? stakeholders tx-sender) err-not-stakeholder))
+            (current-stake (get staked-amount current-stakeholder))
+            (stake-start (get stake-start-block current-stakeholder))
+            (blocks-staked (- block-height stake-start))
+        )
+        (asserts! (>= current-stake amount) err-insufficient-stake)
+        (asserts! (>= blocks-staked (var-get minimum-lock-period)) err-lock-period-active)
+        
+        ;; Calculate and distribute rewards
+        (let
+            (
+                (rewards (calculate-rewards amount blocks-staked))
+                (total-withdrawal (+ amount rewards))
+            )
+            (try! (as-contract (stx-transfer? total-withdrawal contract-owner tx-sender)))
+            
+            (map-set stakeholders tx-sender
+                (merge current-stakeholder
+                    {
+                        staked-amount: (- current-stake amount),
+                        rewards-claimed: (+ (get rewards-claimed current-stakeholder) rewards),
+                        voting-power: (- (get voting-power current-stakeholder) amount)
+                    }
+                )
+            )
+            (var-set total-staked (- (var-get total-staked) amount))
+            (var-set total-voting-power (- (var-get total-voting-power) amount))
+            (ok total-withdrawal)
+        )
+    )
+)
+
 ;; Public Functions - Stakeholder Management
 
 (define-public (register-stakeholder (role (string-ascii 20)))
@@ -97,7 +177,10 @@
                 role: role,
                 voting-power: current-donation,
                 last-active: block-height,
-                total-donated: current-donation
+                total-donated: current-donation,
+                staked-amount: u0,
+                stake-start-block: u0,
+                rewards-claimed: u0
             }
         )
         (var-set total-stakeholders (+ (var-get total-stakeholders) u1))
@@ -254,4 +337,18 @@
 
 (define-read-only (get-total-voting-power)
     (var-get total-voting-power)
+)
+
+(define-read-only (get-pending-rewards (address principal))
+    (let
+        (
+            (stakeholder-info (unwrap! (map-get? stakeholders address) (ok u0)))
+            (current-stake (get staked-amount stakeholder-info))
+            (stake-start (get stake-start-block stakeholder-info))
+        )
+        (if (> current-stake u0)
+            (ok (calculate-rewards current-stake (- block-height stake-start)))
+            (ok u0)
+        )
+    )
 )

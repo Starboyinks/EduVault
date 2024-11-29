@@ -14,6 +14,12 @@
 (define-constant err-threshold-not-met (err u108))
 (define-constant err-insufficient-stake (err u109))
 (define-constant err-lock-period-active (err u110))
+(define-constant err-invalid-role (err u111))
+(define-constant err-invalid-proposal-type (err u112))
+(define-constant err-invalid-description (err u113))
+(define-constant err-invalid-graduation-year (err u114))
+(define-constant err-invalid-target-round (err u115))
+(define-constant err-invalid-proposal-value (err u116))
 
 ;; Data variables
 (define-data-var minimum-donation uint u1000000) ;; In microSTX
@@ -27,6 +33,8 @@
 (define-data-var total-staked uint u0)
 (define-data-var yield-rate uint u5) ;; 5% annual yield rate (can be adjusted via governance)
 (define-data-var minimum-lock-period uint u52560) ;; Minimum staking period in blocks (~1 year)
+(define-data-var current-year uint u2024)
+(define-data-var max-proposal-value uint u1000000000000) ;; Maximum proposal value in microSTX
 
 ;; Principal Maps
 (define-map stakeholders
@@ -92,8 +100,44 @@
     {vote: bool, weight: uint}
 )
 
-;; Staking Functions
+;; Helper Functions
+(define-private (is-valid-role (role (string-ascii 20)))
+    (or 
+        (is-eq role "donor")
+        (is-eq role "educator")
+        (is-eq role "alumni")
+    )
+)
 
+(define-private (is-valid-proposal-type (proposal-type (string-ascii 20)))
+    (or
+        (is-eq proposal-type "fund-distribution")
+        (is-eq proposal-type "parameter-change")
+        (is-eq proposal-type "governance")
+    )
+)
+
+(define-private (is-valid-graduation-year (year uint))
+    (and 
+        (>= year (var-get current-year))
+        (<= year (+ (var-get current-year) u6))
+    )
+)
+
+;; New validation function for proposal value
+(define-private (is-valid-proposal-value (value uint))
+    (and
+        (> value u0)
+        (<= value (var-get max-proposal-value))
+    )
+)
+
+;; New validation function for target round
+(define-private (is-valid-target-round (round uint))
+    (is-some (map-get? scholarship-rounds round))
+)
+
+;; Staking Functions
 (define-read-only (calculate-rewards (staked-amount uint) (blocks-staked uint))
     (let
         (
@@ -140,7 +184,6 @@
         (asserts! (>= current-stake amount) err-insufficient-stake)
         (asserts! (>= blocks-staked (var-get minimum-lock-period)) err-lock-period-active)
         
-        ;; Calculate and distribute rewards
         (let
             (
                 (rewards (calculate-rewards amount blocks-staked))
@@ -165,12 +208,12 @@
 )
 
 ;; Public Functions - Stakeholder Management
-
 (define-public (register-stakeholder (role (string-ascii 20)))
     (let
         (
             (current-donation (default-to u0 (map-get? donors tx-sender)))
         )
+        (asserts! (is-valid-role role) err-invalid-role)
         (asserts! (>= current-donation (var-get minimum-donation)) err-invalid-amount)
         (map-set stakeholders tx-sender
             {
@@ -190,7 +233,6 @@
 )
 
 ;; Public Functions - Fund Management
-
 (define-public (donate)
     (let
         (
@@ -200,12 +242,10 @@
         (asserts! (>= donation-amount (var-get minimum-donation)) err-invalid-amount)
         (try! (stx-transfer? donation-amount tx-sender (as-contract tx-sender)))
         
-        ;; Update donor records
         (map-set donors tx-sender 
             (+ donation-amount (default-to u0 (map-get? donors tx-sender)))
         )
         
-        ;; Update stakeholder voting power if already registered
         (match current-stakeholder
             stakeholder-data
             (begin
@@ -226,11 +266,11 @@
 )
 
 ;; Public Functions - Student Management
-
 (define-public (register-student (gpa uint) (attendance uint) (graduation-year uint))
     (begin
         (asserts! (and (>= gpa u0) (<= gpa u400)) err-invalid-amount)
         (asserts! (and (>= attendance u0) (<= attendance u100)) err-invalid-amount)
+        (asserts! (is-valid-graduation-year graduation-year) err-invalid-graduation-year)
         (map-set students tx-sender
             {
                 gpa: gpa,
@@ -245,7 +285,6 @@
 )
 
 ;; Public Functions - Governance
-
 (define-public (create-proposal 
     (proposal-type (string-ascii 20))
     (description (string-ascii 500))
@@ -257,7 +296,11 @@
             (proposer-info (unwrap! (map-get? stakeholders tx-sender) err-not-stakeholder))
             (proposal-id (var-get next-proposal-id))
         )
+        (asserts! (is-valid-proposal-type proposal-type) err-invalid-proposal-type)
+        (asserts! (not (is-eq description "")) err-invalid-description)
         (asserts! (>= (get voting-power proposer-info) (var-get minimum-voting-power)) err-not-eligible)
+        (asserts! (is-valid-proposal-value value) err-invalid-proposal-value)
+        (asserts! (is-valid-target-round target-round) err-invalid-target-round)
         
         (map-set proposals proposal-id
             {
@@ -314,7 +357,6 @@
 )
 
 ;; Read Only Functions
-
 (define-read-only (get-proposal (proposal-id uint))
     (map-get? proposals proposal-id)
 )
